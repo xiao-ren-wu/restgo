@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/avast/retry-go"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -28,8 +30,14 @@ type HttpMethod string
 
 type ContentType string
 
+type Map map[string]interface{}
+type SMap map[string]string
+type SFunc func() map[string]string
+type AnyFunc func() interface{}
+type ConditionFunc func() (string, string)
+
 const (
-	tmpFile = "tmp/resource.%s"
+	tmpFile = "tmp/resource_%s.%s"
 
 	GET    = HttpMethod("GET")
 	POST   = HttpMethod("POST")
@@ -53,8 +61,8 @@ func init() {
 	client = &http.Client{
 		Timeout: time.Duration(15) * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConnsPerHost:   1,
-			MaxConnsPerHost:       1,
+			MaxIdleConnsPerHost:   512,
+			MaxConnsPerHost:       512,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
@@ -63,11 +71,7 @@ func init() {
 }
 
 type httpBuilder struct {
-	path             string
-	pathParams       string
-	urlParams        string
 	body             interface{}
-	formData         *url.Values
 	contentType      ContentType
 	headers          map[string]string
 	fileKey          string
@@ -75,9 +79,20 @@ type httpBuilder struct {
 	queryVal         map[string]string
 	pathVal          map[string]string
 	curlConsumerFunc func(string)
+	baseURL          string
+	client           *http.Client
+	bodyPayload      []byte
+	rsp              interface{}
+	formFileInfo     *formFileInfo
 }
 
-type respWrapper struct {
+type formFileInfo struct {
+	Reader   io.Reader
+	FileKey  string
+	FileName string
+}
+
+type RespWrapper struct {
 	respBody []byte
 	response *http.Response
 }
@@ -93,8 +108,28 @@ func (builder *httpBuilder) ContentType(contentType ContentType) *httpBuilder {
 	return builder
 }
 
-func (builder *httpBuilder) Headers(headers map[string]string) *httpBuilder {
+func (builder *httpBuilder) Headers(headers map[string]string, conditionFuncs ...ConditionFunc) *httpBuilder {
 	builder.headers = headers
+	if builder.headers == nil {
+		builder.headers = make(map[string]string)
+	}
+	for _, conditionFunc := range conditionFuncs {
+		if k, v := conditionFunc(); k != "" && v != "" {
+			builder.headers[k] = v
+		}
+	}
+	return builder
+}
+
+// HeaderFunc 通过函数计算需要传递的header选项
+func (builder *httpBuilder) HeaderFunc(hf SFunc) *httpBuilder {
+	builder.headers = hf()
+	return builder
+}
+
+// PayloadFunc 通过函数计算需要传递的payload
+func (builder *httpBuilder) PayloadFunc(pf AnyFunc) *httpBuilder {
+	builder.body = pf()
 	return builder
 }
 
@@ -104,9 +139,32 @@ func (builder *httpBuilder) Payload(body interface{}) *httpBuilder {
 	return builder
 }
 
+// BodyPayload 不做任何格式化，直接作为body传递
+func (builder *httpBuilder) BodyPayload(body []byte) *httpBuilder {
+	builder.bodyPayload = body
+	return builder
+}
+
+// RspUnmarshal 对响应体进行反序列化，响应体为JSON形式
+// 如果只关心响应体序列化到结构体的结果，通过设置这个可以减少代码的编写量
+func (builder *httpBuilder) RspUnmarshal(v interface{}) *httpBuilder {
+	builder.rsp = v
+	return builder
+}
+
 func (builder *httpBuilder) File(key, path string) *httpBuilder {
 	builder.fileKey = key
 	builder.filePath = path
+	return builder
+}
+
+// FileReader 另外一种上传文件的方式，手动指定reader，如果同时设置调用了 File 方法，那么 File 方法中的参数会优先
+func (builder *httpBuilder) FileReader(key, filename string, reader io.Reader) *httpBuilder {
+	builder.formFileInfo = &formFileInfo{
+		Reader:   reader,
+		FileKey:  key,
+		FileName: filename,
+	}
 	return builder
 }
 
@@ -122,7 +180,14 @@ func (builder *httpBuilder) PathVariable(pathVal map[string]string) *httpBuilder
 	return builder
 }
 
-func (builder *httpBuilder) Send(method HttpMethod, url string) (*respWrapper, error) {
+func (builder *httpBuilder) SetClient(client *http.Client) *httpBuilder {
+	builder.client = client
+	return builder
+}
+
+func (builder *httpBuilder) Send(method HttpMethod, url string) (*RespWrapper, error) {
+	// 避免传值传的不是标准的请求方法导致请求错误
+	method = HttpMethod(strings.ToUpper(string(method)))
 
 	body, contentType, curlPayload, err := builder.generatePayloadAndContentType()
 	if err != nil {
@@ -138,21 +203,12 @@ func (builder *httpBuilder) Send(method HttpMethod, url string) (*respWrapper, e
 	if query != "" {
 		url = fmt.Sprintf("%s?%s", url, query)
 	}
-	var req *http.Request
+	if builder.baseURL != "" {
+		url = fmt.Sprintf("%s%s", builder.baseURL, url)
+	}
+
 	if body == nil {
 		body = bytes.NewBufferString("")
-	}
-	req, err = http.NewRequest(string(method), url, body)
-
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Content-Type", contentType)
-
-	if builder.headers != nil {
-		for k, v := range builder.headers {
-			req.Header.Add(k, v)
-		}
 	}
 
 	if builder.curlConsumerFunc != nil {
@@ -160,26 +216,21 @@ func (builder *httpBuilder) Send(method HttpMethod, url string) (*respWrapper, e
 		builder.curlConsumerFunc(curl)
 	}
 
-	resp, err := client.Do(req)
-
+	var respW *RespWrapper
+	respW, err = builder.sendUsingHTTPClient(url, string(method), body, contentType)
 	if err != nil {
 		return nil, err
 	}
-
-	defer resp.Body.Close()
-
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if builder.rsp != nil {
+		if err = json.Unmarshal(respW.respBody, builder.rsp); err != nil {
+			return nil, err
+		}
 	}
-	return &respWrapper{
-		respBody: bodyBytes,
-		response: resp,
-	}, nil
+	return respW, nil
 
 }
 
-func (wrapper *respWrapper) Header(key string) string {
+func (wrapper *RespWrapper) Header(key string) string {
 	if wrapper != nil {
 		if wrapper.response != nil {
 			return wrapper.response.Header.Get(key)
@@ -188,20 +239,20 @@ func (wrapper *respWrapper) Header(key string) string {
 	return ""
 }
 
-func (wrapper *respWrapper) BodyStr() string {
+func (wrapper *RespWrapper) BodyStr() string {
 	return string(wrapper.respBody)
 }
 
-func (wrapper *respWrapper) Body() []byte {
+func (wrapper *RespWrapper) Body() []byte {
 	return wrapper.respBody
 }
 
-func (wrapper *respWrapper) BodyUnmarshal(v interface{}) error {
+func (wrapper *RespWrapper) BodyUnmarshal(v interface{}) error {
 	return json.Unmarshal(wrapper.respBody, v)
 }
 
 // WriteFile 如果响应是一个文件，可以通过该方法下载文件，path为文件下载路径
-func (wrapper *respWrapper) WriteFile(path string) error {
+func (wrapper *RespWrapper) WriteFile(path string) error {
 	if path == "" {
 		return fmt.Errorf("writefile failed, path must not be emoty")
 	}
@@ -224,7 +275,17 @@ func (builder *httpBuilder) Curl(curlConsumer func(curl string)) *httpBuilder {
 	return builder
 }
 
+func (builder *httpBuilder) BaseUrl(baseURL string) *httpBuilder {
+	builder.baseURL = baseURL
+	return builder
+}
+
 func (builder *httpBuilder) generatePayloadAndContentType() (payload *bytes.Buffer, contentType string, bodyCurl string, err error) {
+	if len(builder.bodyPayload) > 0 {
+		return bytes.NewBuffer(builder.bodyPayload),
+			string(builder.contentType),
+			builder.generateJsonPayloadCurl(string(builder.bodyPayload)), nil
+	}
 
 	if builder.fileKey != "" {
 		builder.contentType = FormData
@@ -249,6 +310,13 @@ func (builder *httpBuilder) generateFormDataFileWriter() (*bytes.Buffer, string,
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	var err error
+
+	defer func(writer *multipart.Writer) {
+		err := writer.Close()
+		if err != nil {
+			fmt.Printf("close file failed, fail info: %v\n", err)
+		}
+	}(writer)
 
 	if builder.filePath != "" {
 		var tmpFile string
@@ -281,17 +349,20 @@ func (builder *httpBuilder) generateFormDataFileWriter() (*bytes.Buffer, string,
 			return nil, "", "", err
 		}
 
-		defer func(writer *multipart.Writer) {
-			err := writer.Close()
-			if err != nil {
-				fmt.Printf("close file failed, fail info: %v\n", err)
-			}
-		}(writer)
-
-		fromWriter, err := writer.CreateFormFile(builder.fileKey, filepath.Base(builder.filePath))
-		_, err = io.Copy(fromWriter, file)
-
+		formWriter, err := writer.CreateFormFile(builder.fileKey, filepath.Base(builder.filePath))
 		if err != nil {
+			return nil, "", "", err
+		}
+		_, err = io.Copy(formWriter, file)
+		if err != nil {
+			return nil, "", "", err
+		}
+	} else if builder.formFileInfo != nil {
+		formWriter, err := writer.CreateFormFile(builder.formFileInfo.FileKey, filepath.Base(builder.formFileInfo.FileName))
+		if err != nil {
+			return nil, "", "", err
+		}
+		if _, err = io.Copy(formWriter, builder.formFileInfo.Reader); err != nil {
 			return nil, "", "", err
 		}
 	}
@@ -308,6 +379,8 @@ func (builder *httpBuilder) generateFormDataFileWriter() (*bytes.Buffer, string,
 		for key, val := range param {
 			_ = writer.WriteField(key, val)
 		}
+	} else {
+		formDataPayloadCurl = builder.generateFormDataPayloadCurl(nil)
 	}
 
 	return body, writer.FormDataContentType(), formDataPayloadCurl, nil
@@ -338,13 +411,16 @@ func (builder *httpBuilder) saveTmpFile() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	wrapper := &respWrapper{
+	wrapper := &RespWrapper{
 		respBody: bodyBytes,
 		response: resp,
 	}
 	contentType := http.DetectContentType(wrapper.respBody)
 	suffix := strings.Split(contentType, "/")[1]
-	tmpFile := fmt.Sprintf(tmpFile, suffix)
+
+	// 生成临时文件前缀，防止并发上传文件名称冲突问题
+	filePrefix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), rand.Int63())
+	tmpFile := fmt.Sprintf(tmpFile, filePrefix, suffix)
 	err = wrapper.WriteFile(tmpFile)
 	if err != nil {
 		return "", err
@@ -361,7 +437,7 @@ func (builder *httpBuilder) generateOctetStreamWriter() (*bytes.Buffer, string, 
 	return nil, "", "", fmt.Errorf("body convert bytes failed")
 }
 
-func (wrapper *respWrapper) pathExists(path string) (bool, error) {
+func (wrapper *RespWrapper) pathExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil
@@ -449,6 +525,8 @@ func (builder *httpBuilder) generateFormDataPayloadCurl(param map[string]string)
 	}
 	if builder.fileKey != "" {
 		buf.WriteString(fmt.Sprintf("--form '%s=@\"%s\"' \\\n", builder.fileKey, builder.filePath))
+	} else if builder.formFileInfo != nil {
+		buf.WriteString(fmt.Sprintf("--form '%s=@\"%s\"' \\\n", builder.formFileInfo.FileKey, builder.formFileInfo.FileName))
 	}
 	return buf.String()
 }
@@ -456,10 +534,104 @@ func (builder *httpBuilder) generateFormDataPayloadCurl(param map[string]string)
 func (builder *httpBuilder) generateCurl(headers map[string]string, contentType, payload string, url string, method HttpMethod) string {
 	var buf strings.Builder
 	buf.WriteString(fmt.Sprintf("curl --location --request %s '%s' \\\n", method, url))
-	buf.WriteString(fmt.Sprintf("--header '%s: %s' \\\n", "Content-Type", contentType))
+	if contentType != "" {
+		buf.WriteString(fmt.Sprintf("--header '%s: %s' \\\n", "Content-Type", contentType))
+	}
 	for k, v := range headers {
 		buf.WriteString(fmt.Sprintf("--header '%s: %s' \\\n", k, v))
 	}
 	buf.WriteString(payload)
 	return buf.String()
+}
+
+// Status 获取http状态码
+func (wrapper *RespWrapper) Status() string {
+	return wrapper.response.Status
+}
+
+func (wrapper *RespWrapper) StatusCode() int {
+	return wrapper.response.StatusCode
+}
+
+func (wrapper *RespWrapper) Proto() string {
+	return wrapper.response.Proto
+}
+
+func (wrapper *RespWrapper) ProtoMajor() int {
+	return wrapper.response.ProtoMajor
+}
+
+func (wrapper *RespWrapper) ProtoMinor() int {
+	return wrapper.response.ProtoMinor
+}
+
+type HttpBuilder struct {
+	builder *httpBuilder
+}
+
+// Build 用于保存生成的 httpBuilder，方便重复发起请求，该 HttpBuilder 是只读的
+func (builder *httpBuilder) Build() *HttpBuilder {
+	return &HttpBuilder{
+		builder: builder,
+	}
+}
+
+func (builder *httpBuilder) sendUsingHTTPClient(
+	url string, method string, body *bytes.Buffer, contentType string,
+) (*RespWrapper, error) {
+	var resp *http.Response
+	var err error
+	var req *http.Request
+	req, err = http.NewRequest(method, url, body)
+
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Content-Type", contentType)
+
+	if builder.headers != nil {
+		for k, v := range builder.headers {
+			req.Header.Add(k, v)
+		}
+	}
+	// 设置局部的client使用局部的client发请求
+	if builder.client != nil {
+		resp, err = builder.client.Do(req)
+	} else {
+		resp, err = client.Do(req)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &RespWrapper{
+		respBody: bodyBytes,
+		response: resp,
+	}, nil
+}
+
+// ToBuilder 将 HttpBuilder 转换成 httpBuilder
+func (hb *HttpBuilder) ToBuilder() *httpBuilder {
+	return hb.builder
+}
+
+func (hb *HttpBuilder) Send(method HttpMethod, url string) (*RespWrapper, error) {
+	return hb.builder.Send(method, url)
+}
+
+func (builder *httpBuilder) SendWithRetry(method HttpMethod, url string, resF func(respW *RespWrapper, err error) error, ops ...retry.Option) (*RespWrapper, error) {
+	var respW *RespWrapper
+	var err error
+	err = retry.Do(func() error {
+		respW, err = builder.Send(method, url)
+		return resF(respW, err)
+	}, ops...)
+	return respW, err
 }
