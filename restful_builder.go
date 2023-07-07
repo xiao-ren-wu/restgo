@@ -2,9 +2,9 @@ package restgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/avast/retry-go"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/avast/retry-go"
 )
 
 // 提供"傻瓜式"HTTP客户端工具,用户只需要通过"点点点"的编程风格即可构造一个http请求
@@ -186,48 +188,7 @@ func (builder *httpBuilder) SetClient(client *http.Client) *httpBuilder {
 }
 
 func (builder *httpBuilder) Send(method HttpMethod, url string) (*RespWrapper, error) {
-	// 避免传值传的不是标准的请求方法导致请求错误
-	method = HttpMethod(strings.ToUpper(string(method)))
-
-	body, contentType, curlPayload, err := builder.generatePayloadAndContentType()
-	if err != nil {
-		return nil, err
-	}
-
-	url, err = builder.setPathVariable(url)
-	if err != nil {
-		return nil, err
-	}
-
-	query := builder.generateQuery()
-	if query != "" {
-		url = fmt.Sprintf("%s?%s", url, query)
-	}
-	if builder.baseURL != "" {
-		url = fmt.Sprintf("%s%s", builder.baseURL, url)
-	}
-
-	if body == nil {
-		body = bytes.NewBufferString("")
-	}
-
-	if builder.curlConsumerFunc != nil {
-		curl := builder.generateCurl(builder.headers, contentType, curlPayload, url, method)
-		builder.curlConsumerFunc(curl)
-	}
-
-	var respW *RespWrapper
-	respW, err = builder.sendUsingHTTPClient(url, string(method), body, contentType)
-	if err != nil {
-		return nil, err
-	}
-	if builder.rsp != nil {
-		if err = json.Unmarshal(respW.respBody, builder.rsp); err != nil {
-			return nil, err
-		}
-	}
-	return respW, nil
-
+	return builder.CtxSend(context.Background(), method, url)
 }
 
 func (wrapper *RespWrapper) Header(key string) string {
@@ -577,13 +538,12 @@ func (builder *httpBuilder) Build() *HttpBuilder {
 }
 
 func (builder *httpBuilder) sendUsingHTTPClient(
-	url string, method string, body *bytes.Buffer, contentType string,
+	ctx context.Context, url string, method string, body *bytes.Buffer, contentType string,
 ) (*RespWrapper, error) {
 	var resp *http.Response
 	var err error
 	var req *http.Request
-	req, err = http.NewRequest(method, url, body)
-
+	req, err = http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -622,8 +582,56 @@ func (hb *HttpBuilder) ToBuilder() *httpBuilder {
 	return hb.builder
 }
 
+func (builder *httpBuilder) CtxSend(ctx context.Context, method HttpMethod, url string) (*RespWrapper, error) {
+	// 避免传值传的不是标准的请求方法导致请求错误
+	method = HttpMethod(strings.ToUpper(string(method)))
+
+	body, contentType, curlPayload, err := builder.generatePayloadAndContentType()
+	if err != nil {
+		return nil, err
+	}
+
+	url, err = builder.setPathVariable(url)
+	if err != nil {
+		return nil, err
+	}
+
+	query := builder.generateQuery()
+	if query != "" {
+		url = fmt.Sprintf("%s?%s", url, query)
+	}
+	if builder.baseURL != "" {
+		url = fmt.Sprintf("%s%s", builder.baseURL, url)
+	}
+
+	if body == nil {
+		body = bytes.NewBufferString("")
+	}
+
+	if builder.curlConsumerFunc != nil {
+		curl := builder.generateCurl(builder.headers, contentType, curlPayload, url, method)
+		builder.curlConsumerFunc(curl)
+	}
+
+	var respW *RespWrapper
+	respW, err = builder.sendUsingHTTPClient(ctx, url, string(method), body, contentType)
+	if err != nil {
+		return nil, err
+	}
+	if builder.rsp != nil {
+		if err = json.Unmarshal(respW.respBody, builder.rsp); err != nil {
+			return nil, err
+		}
+	}
+	return respW, nil
+}
+
 func (hb *HttpBuilder) Send(method HttpMethod, url string) (*RespWrapper, error) {
 	return hb.builder.Send(method, url)
+}
+
+func (hb *HttpBuilder) CtxSend(ctx context.Context, method HttpMethod, url string) (*RespWrapper, error) {
+	return hb.builder.CtxSend(ctx, method, url)
 }
 
 func (builder *httpBuilder) SendWithRetry(method HttpMethod, url string, resF func(respW *RespWrapper, err error) error, ops ...retry.Option) (*RespWrapper, error) {
@@ -631,6 +639,16 @@ func (builder *httpBuilder) SendWithRetry(method HttpMethod, url string, resF fu
 	var err error
 	err = retry.Do(func() error {
 		respW, err = builder.Send(method, url)
+		return resF(respW, err)
+	}, ops...)
+	return respW, err
+}
+
+func (builder *httpBuilder) CtxSendWithRetry(ctx context.Context, method HttpMethod, url string, resF func(respW *RespWrapper, err error) error, ops ...retry.Option) (*RespWrapper, error) {
+	var respW *RespWrapper
+	var err error
+	err = retry.Do(func() error {
+		respW, err = builder.CtxSend(ctx, method, url)
 		return resF(respW, err)
 	}, ops...)
 	return respW, err
