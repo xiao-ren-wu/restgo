@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -86,6 +87,7 @@ type httpBuilder struct {
 	bodyPayload      []byte
 	rsp              interface{}
 	formFileInfo     *formFileInfo
+	trace            *httptrace.ClientTrace
 }
 
 type formFileInfo struct {
@@ -543,6 +545,9 @@ func (builder *httpBuilder) sendUsingHTTPClient(
 	var resp *http.Response
 	var err error
 	var req *http.Request
+	if builder.trace != nil {
+		ctx = httptrace.WithClientTrace(ctx, builder.trace)
+	}
 	req, err = http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -575,6 +580,11 @@ func (builder *httpBuilder) sendUsingHTTPClient(
 		respBody: bodyBytes,
 		response: resp,
 	}, nil
+}
+
+func (builder *httpBuilder) Trace(trace *httptrace.ClientTrace) *httpBuilder {
+	builder.trace = trace
+	return builder
 }
 
 // ToBuilder 将 HttpBuilder 转换成 httpBuilder
