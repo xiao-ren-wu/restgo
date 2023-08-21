@@ -18,5 +18,5 @@ type Response interface {
 }
 
 type RestGo interface {
-	Do(ctx context.Context, url string, method string, body *bytes.Buffer, contentType string) (Response, error)
+	Do(ctx context.Context, url string, method string, body *bytes.Buffer, contentType string, headers map[string]string) (Response, error)
 }

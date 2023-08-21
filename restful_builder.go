@@ -452,7 +452,7 @@ func (builder *Builder) generateCurl(headers map[string]string, contentType, pay
 	return buf.String()
 }
 
-func (builder *Builder) Do(ctx context.Context, url string, method string, body *bytes.Buffer, contentType string) (Response, error) {
+func (builder *Builder) Do(ctx context.Context, url string, method string, body *bytes.Buffer, contentType string, headers map[string]string) (Response, error) {
 	var rsp *http.Response
 	var err error
 	var req *http.Request
@@ -465,7 +465,7 @@ func (builder *Builder) Do(ctx context.Context, url string, method string, body 
 	}
 	req.Header.Add("Content-Type", contentType)
 
-	if builder.headers != nil {
+	if headers != nil {
 		for k, v := range builder.headers {
 			req.Header.Add(k, v)
 		}
@@ -483,7 +483,7 @@ func (builder *Builder) Do(ctx context.Context, url string, method string, body 
 
 	defer rsp.Body.Close()
 
-	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	bodyBytes, err := io.ReadAll(rsp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -536,12 +536,12 @@ func (builder *Builder) CtxSend(ctx context.Context, method HttpMethod, url stri
 
 	var respW Response
 	if builder.customerRestGo != nil {
-		respW, err = builder.customerRestGo.Do(ctx, url, string(method), body, contentType)
+		respW, err = builder.customerRestGo.Do(ctx, url, string(method), body, contentType, builder.headers)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		respW, err = builder.Do(ctx, url, string(method), body, contentType)
+		respW, err = builder.Do(ctx, url, string(method), body, contentType, builder.headers)
 		if err != nil {
 			return nil, err
 		}
