@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -53,24 +51,8 @@ const (
 	OctetStream     = ContentType("binary/octet-stream")
 )
 
-var client *http.Client
-
 var ConsolePrint = func(curl string) {
 	fmt.Println(curl)
-}
-
-// 配置参考：https://xujiahua.github.io/posts/20200723-golang-http-reuse/
-func init() {
-	client = &http.Client{
-		Timeout: time.Duration(15) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConnsPerHost:   512,
-			MaxConnsPerHost:       512,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
 }
 
 type Builder struct {
@@ -83,12 +65,10 @@ type Builder struct {
 	pathVal          map[string]string
 	curlConsumerFunc func(string)
 	baseURL          string
-	client           *http.Client
 	bodyPayload      []byte
 	rsp              interface{}
 	formFileInfo     *formFileInfo
-	trace            *httptrace.ClientTrace
-	customerRestGo   RestGo
+	restGo           RestGo
 }
 
 type formFileInfo struct {
@@ -100,6 +80,7 @@ type formFileInfo struct {
 func NewRestGoBuilder() *Builder {
 	return &Builder{
 		contentType: "application/json",
+		restGo:      defaultRestGoInstance,
 	}
 }
 
@@ -177,11 +158,6 @@ func (builder *Builder) Query(queryVal map[string]string) *Builder {
 // PathVariable 路径参数
 func (builder *Builder) PathVariable(pathVal map[string]string) *Builder {
 	builder.pathVal = pathVal
-	return builder
-}
-
-func (builder *Builder) SetClient(client *http.Client) *Builder {
-	builder.client = client
 	return builder
 }
 
@@ -326,7 +302,7 @@ func (builder *Builder) saveTmpFile() (string, error) {
 	}
 	defer rsp.Body.Close()
 
-	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	bodyBytes, err := io.ReadAll(rsp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -452,54 +428,8 @@ func (builder *Builder) generateCurl(headers map[string]string, contentType, pay
 	return buf.String()
 }
 
-func (builder *Builder) Do(ctx context.Context, url string, method string, body *bytes.Buffer, contentType string, headers map[string]string) (Response, error) {
-	var rsp *http.Response
-	var err error
-	var req *http.Request
-	if builder.trace != nil {
-		ctx = httptrace.WithClientTrace(ctx, builder.trace)
-	}
-	req, err = http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Content-Type", contentType)
-
-	if headers != nil {
-		for k, v := range builder.headers {
-			req.Header.Add(k, v)
-		}
-	}
-	// 设置局部的client使用局部的client发请求
-	if builder.client != nil {
-		rsp, err = builder.client.Do(req)
-	} else {
-		rsp, err = client.Do(req)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	defer rsp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return &IResponse{
-		respBody: bodyBytes,
-		response: rsp,
-	}, nil
-}
-
-func (builder *Builder) Trace(trace *httptrace.ClientTrace) *Builder {
-	builder.trace = trace
-	return builder
-}
-
 func (builder *Builder) CustomRestGo(customRestGo RestGo) *Builder {
-	builder.customerRestGo = customRestGo
+	builder.restGo = customRestGo
 	return builder
 }
 
@@ -535,17 +465,11 @@ func (builder *Builder) CtxSend(ctx context.Context, method HttpMethod, url stri
 	}
 
 	var respW Response
-	if builder.customerRestGo != nil {
-		respW, err = builder.customerRestGo.Do(ctx, url, string(method), body, contentType, builder.headers)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		respW, err = builder.Do(ctx, url, string(method), body, contentType, builder.headers)
-		if err != nil {
-			return nil, err
-		}
+	respW, err = builder.restGo.Do(ctx, url, string(method), body, contentType, builder.headers)
+	if err != nil {
+		return nil, err
 	}
+
 	if builder.rsp != nil {
 		if err = json.Unmarshal(respW.Body(), builder.rsp); err != nil {
 			return nil, err
