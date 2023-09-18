@@ -6,31 +6,37 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"sync"
 	"time"
 )
 
 var client *http.Client
 
-// 配置参考：https://xujiahua.github.io/posts/20200723-golang-http-reuse/
-func init() {
-	client = &http.Client{
-		Timeout: time.Duration(15) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConnsPerHost:   512,
-			MaxConnsPerHost:       512,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
-}
+var initOnce sync.Once
 
 type defaultRestGo struct {
 	client *http.Client
 	trace  *httptrace.ClientTrace
 }
 
-var defaultRestGoInstance RestGo = NewDefaultRestGo(client, nil)
+// 配置参考：https://xujiahua.github.io/posts/20200723-golang-http-reuse/
+func initClient() *http.Client {
+	initOnce.Do(func() {
+		client = &http.Client{
+			Timeout: time.Duration(15) * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost:   512,
+				MaxConnsPerHost:       512,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		}
+	})
+	return client
+}
+
+var defaultRestGoInstance RestGo = NewDefaultRestGo(initClient(), nil)
 
 func NewDefaultRestGo(cli *http.Client, trace *httptrace.ClientTrace) *defaultRestGo {
 	return &defaultRestGo{client: cli, trace: trace}
