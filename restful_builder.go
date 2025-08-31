@@ -69,6 +69,7 @@ type Builder struct {
 	rsp              interface{}
 	formFileInfo     *formFileInfo
 	restGo           RestGo
+	forTest          bool
 }
 
 type formFileInfo struct {
@@ -172,6 +173,11 @@ func (builder *Builder) Curl(curlConsumer func(curl string)) *Builder {
 
 func (builder *Builder) BaseUrl(baseURL string) *Builder {
 	builder.baseURL = baseURL
+	return builder
+}
+
+func (builder *Builder) ForTest() *Builder {
+	builder.forTest = true
 	return builder
 }
 
@@ -462,6 +468,10 @@ func (builder *Builder) CtxSend(ctx context.Context, method HttpMethod, url stri
 	if builder.curlConsumerFunc != nil {
 		curl := builder.generateCurl(builder.headers, contentType, curlPayload, url, method)
 		builder.curlConsumerFunc(curl)
+	}
+
+	if builder.forTest {
+		return new(EmptyResponse), err
 	}
 
 	var respW Response
