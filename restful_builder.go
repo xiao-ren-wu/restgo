@@ -70,6 +70,7 @@ type Builder struct {
 	formFileInfo     *formFileInfo
 	restGo           RestGo
 	forTest          bool
+	streamRestGo     StreamRestGo
 }
 
 type formFileInfo struct {
@@ -80,8 +81,9 @@ type formFileInfo struct {
 
 func NewRestGoBuilder() *Builder {
 	return &Builder{
-		contentType: "application/json",
-		restGo:      defaultRestGoInstance,
+		contentType:  "application/json",
+		restGo:       defaultRestGoInstance,
+		streamRestGo: defaultStreamRestGoInstance,
 	}
 }
 
@@ -437,6 +439,53 @@ func (builder *Builder) generateCurl(headers map[string]string, contentType, pay
 func (builder *Builder) CustomRestGo(customRestGo RestGo) *Builder {
 	builder.restGo = customRestGo
 	return builder
+}
+
+func (builder *Builder) CustomStreamRestGo(customStreamRestGo StreamRestGo) *Builder {
+	builder.streamRestGo = customStreamRestGo
+	return builder
+}
+
+func (builder *Builder) StreamSend(method HttpMethod, url string, callback func(resp StreamResponse, rspBody string) error) error {
+	return builder.CtxStreamSend(context.Background(), method, url, callback)
+}
+
+func (builder *Builder) CtxStreamSend(ctx context.Context, method HttpMethod, url string, callback func(resp StreamResponse, rspBody string) error) error {
+	// 避免传值传的不是标准的请求方法导致请求错误
+	method = HttpMethod(strings.ToUpper(string(method)))
+
+	body, contentType, curlPayload, err := builder.generatePayloadAndContentType()
+	if err != nil {
+		return err
+	}
+
+	url, err = builder.setPathVariable(url)
+	if err != nil {
+		return err
+	}
+
+	query := builder.generateQuery()
+	if query != "" {
+		url = fmt.Sprintf("%s?%s", url, query)
+	}
+	if builder.baseURL != "" {
+		url = fmt.Sprintf("%s%s", builder.baseURL, url)
+	}
+
+	if body == nil {
+		body = bytes.NewBufferString("")
+	}
+
+	if builder.curlConsumerFunc != nil {
+		curl := builder.generateCurl(builder.headers, contentType, curlPayload, url, method)
+		builder.curlConsumerFunc(curl)
+	}
+
+	if builder.forTest {
+		return nil
+	}
+
+	return builder.streamRestGo.DoStream(ctx, url, string(method), body, contentType, builder.headers, callback)
 }
 
 func (builder *Builder) CtxSend(ctx context.Context, method HttpMethod, url string) (Response, error) {
